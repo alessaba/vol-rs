@@ -149,9 +149,30 @@ pub fn public_symbols(data: &[u8]) -> Result<PublicSymbols> {
             "The database describes no section headers".to_string(),
         ));
     }
-    // Skip past sections we don't care about to get to the DBG header.
-    let section_stream = read_u16(&debug, optional_at + 10)?;
+    // The optional debug header is a list of 16-bit stream numbers: the section
+    // headers at byte ten, the translation table at eight, and the headers of
+    // the image the database was built from at twenty.
+    //
+    // An image whose layout was rearranged before the final link keeps the
+    // headers of the image it was built from, and the table translating those
+    // addresses to the ones it was linked at, in streams of their own. The
+    // symbols name addresses in the original image, so where the original
+    // headers are named they are the ones to read, and the table is applied to
+    // every address.
+    let optional = |at: usize| read_u16(&debug, optional_at + at);
+    let original = optional(20).ok().filter(|stream| *stream != 0xFFFF);
+    let section_stream = match original {
+        Some(stream) if optional_size >= 22 => stream,
+        _ => optional(10)?,
+    };
     let sections = image_sections(&file.stream(section_stream as usize)?);
+    let omap = match original {
+        Some(_) if optional_size >= 22 => match optional(8) {
+            Ok(stream) if stream != 0xFFFF => read_omap(&file.stream(stream as usize)?),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
 
     // Every public symbol names a section and an offset within it. For speed
     // we don't use the framework to read this (usually sizeable) data.
@@ -179,9 +200,13 @@ pub fn public_symbols(data: &[u8]) -> Result<PublicSymbols> {
                 .unwrap_or(at + 2 + length);
             if segment >= 1 && segment <= sections.len() {
                 let name = String::from_utf8_lossy(&symbols[name_at..end]).to_string();
-                addresses
-                    .entry(name)
-                    .or_insert(sections[segment - 1] + offset);
+                let address = sections[segment - 1] + offset;
+                let address = if omap.is_empty() {
+                    address
+                } else {
+                    omap_lookup(&omap, address)
+                };
+                addresses.entry(name).or_insert(address);
             }
         }
         at += 2 + length;
@@ -204,6 +229,40 @@ pub fn image_sections(data: &[u8]) -> Vec<u32> {
         at += 40;
     }
     found
+}
+
+/// The translation from an image's original addresses to its linked ones.
+///
+/// The table is a run of pairs, sorted by the address they translate from,
+/// each giving where the bytes that began at that address were placed.
+fn read_omap(data: &[u8]) -> Vec<(u32, u32)> {
+    let mut mapping = Vec::with_capacity(data.len() / 8);
+    let mut at = 0usize;
+    while at + 8 <= data.len() {
+        let (Ok(from), Ok(to)) = (read_u32(data, at), read_u32(data, at + 4)) else {
+            break;
+        };
+        mapping.push((from, to));
+        at += 8;
+    }
+    mapping
+}
+
+/// Where an address in the original image sits in the linked one.
+///
+/// The last pair that starts at or below the address covers it. A pair whose
+/// destination is zero names a part of the image the linker dropped, which is
+/// reported as address zero rather than as a symbol that is missing.
+fn omap_lookup(mapping: &[(u32, u32)], address: u32) -> u32 {
+    let covered = mapping.partition_point(|(from, _)| *from <= address);
+    let Some((from, to)) = covered.checked_sub(1).map(|index| mapping[index]) else {
+        return 0;
+    };
+    if to == 0 {
+        0
+    } else {
+        to.wrapping_add(address - from)
+    }
 }
 
 /// A database is a file of fixed-size blocks, with a directory saying which
