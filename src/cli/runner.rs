@@ -186,11 +186,16 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
         let parsed: serde_json::Value = serde_json::from_str(value).map_err(|error| {
             VolatilityError::Other(format!("Could not read the setting '{extension}': {error}"))
         })?;
+        let path = setting_path(path, plugin_class(plugin.as_ref()));
         if record_image_setting(&context, path, &parsed) {
             continue;
         }
+        if path.contains('.') {
+            log::debug!("Ignoring the setting '{extension}', which does not name an option");
+            continue;
+        }
         if let Some(value) = json_to_config(&parsed) {
-            config.set(setting_name(path), value);
+            config.set(path, value);
         }
     }
 
@@ -209,7 +214,13 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
         .as_deref()
         .map(location_to_path)
         .transpose()?
-        .or_else(|| arguments.image.as_deref().map(std::path::PathBuf::from));
+        .or_else(|| arguments.image.as_deref().map(std::path::PathBuf::from))
+        .or_else(|| {
+            context
+                .config
+                .get_string("automagic.single_location")
+                .map(std::path::PathBuf::from)
+        });
 
     // A run may name which image formats to try.
     if !arguments.stackers.is_empty() {
@@ -471,6 +482,17 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+/// The settings that describe the image rather than a plugin option, in the
+/// order the search itself would prefer them.
+const IMAGE_SETTINGS: [&str; 6] = [
+    "kernel.layer_name.kernel_virtual_offset",
+    "kernel.offset",
+    "kernel.layer_name.page_map_offset",
+    "kernel.layer_name.memory_layer.location",
+    "kernel.symbol_table_name.isf_url",
+    "automagic.LayerStacker.single_location",
+];
+
 /// Read a configuration file and apply the settings it holds.
 ///
 /// A file written by a previous run describes the whole configuration, most of
@@ -493,45 +515,70 @@ fn apply_configuration_file(
         )));
     };
 
+    let class = plugin_class(plugin);
     let requirements = plugin.requirements();
-    for (key, value) in settings.iter().filter(|(key, _)| !is_image_setting(key)) {
-        let name = setting_name(key);
+    let mut image = std::collections::HashMap::new();
+    for (key, value) in settings {
+        let path = setting_path(key, class);
+        if is_image_setting(path) {
+            image.insert(path, value);
+            continue;
+        }
+        // A dotted path names a part of the framework's own tree, which this
+        // port keeps out of the plugin's settings, so it is left alone rather
+        // than mistaken for an option of the same name.
+        if path.contains('.') {
+            log::debug!("Ignoring the setting '{key}', which does not name an option");
+            continue;
+        }
         if !requirements
             .iter()
-            .any(|requirement| requirement.name == name)
+            .any(|requirement| requirement.name == path)
         {
             log::debug!("Ignoring the setting '{key}', which this plugin does not take");
             continue;
         }
         if let Some(value) = json_to_config(value) {
-            config.set(name, value);
+            config.set(path, value);
         }
     }
+
     // Where the kernel sits and which file describes it are worked out by the
     // automagic, but an image can carry a second copy of its kernel's header
     // that the search mistakes for the real one, and then nothing can be read.
     // A configuration names the right ones, so they are taken in the order the
     // search itself would prefer them.
-    for key in [
-        "kernel.layer_name.kernel_virtual_offset",
-        "kernel.offset",
-        "kernel.symbol_table_name.isf_url",
-    ] {
-        if let Some(value) = settings.get(key) {
+    for key in IMAGE_SETTINGS {
+        if let Some(value) = image.get(key) {
             record_image_setting(context, key, value);
         }
     }
     Ok(())
 }
 
+/// The name a plugin is known by in a written configuration.
+fn plugin_class(plugin: &dyn crate::framework::plugins::Plugin) -> &str {
+    plugin.name().rsplit('.').next().unwrap_or_default()
+}
+
+/// The path a setting has inside the running plugin.
+///
+/// A configuration written by `--record-config` names the plugin each section
+/// belongs to, and the reference implementation drops the whole file under the
+/// running plugin's own name. A section for another plugin therefore has
+/// nowhere to go, while a section for this plugin, or a setting with no name on
+/// it at all, is this run's.
+fn setting_path<'a>(key: &'a str, class: &str) -> &'a str {
+    let key = key.strip_prefix("plugins.").unwrap_or(key);
+    match key.split_once('.') {
+        Some((name, rest)) if name == class => rest,
+        _ => key,
+    }
+}
+
 /// Whether a setting describes the image rather than a plugin option.
 fn is_image_setting(key: &str) -> bool {
-    matches!(
-        key,
-        "kernel.offset"
-            | "kernel.layer_name.kernel_virtual_offset"
-            | "kernel.symbol_table_name.isf_url"
-    )
+    IMAGE_SETTINGS.contains(&key)
 }
 
 /// Store one of the settings that name where the kernel and its symbols are.
@@ -556,11 +603,38 @@ fn record_image_setting(
             }
             true
         }
+        // Where the page tables were found is searched for when it is not
+        // given, and an image with several plausible ones can settle on the
+        // wrong table without it.
+        "kernel.layer_name.page_map_offset" => {
+            if let Some(offset) = value.as_u64() {
+                context.config.set(
+                    "automagic.declared_dtb",
+                    ConfigValue::Int(offset as i64),
+                );
+            }
+            true
+        }
+        // The image a configuration names is opened when the command line does
+        // not name one.
+        "kernel.layer_name.memory_layer.location" | "automagic.LayerStacker.single_location" => {
+            let Some(url) = value.as_str() else {
+                return true;
+            };
+            match file_path(url) {
+                Some(path) => context.config.set(
+                    "automagic.single_location",
+                    ConfigValue::Str(path.display().to_string()),
+                ),
+                None => log::warn!("Only file locations are supported, not '{url}'"),
+            }
+            true
+        }
         "kernel.symbol_table_name.isf_url" => {
             let Some(url) = value.as_str() else {
                 return true;
             };
-            match symbol_path(url) {
+            match file_path(url) {
                 Some(path) => context.config.set(
                     "automagic.symbol_file",
                     ConfigValue::Str(path.display().to_string()),
@@ -573,22 +647,17 @@ fn record_image_setting(
     }
 }
 
-/// The file a symbol URL names.
+/// The file a `file:` URL names.
 ///
 /// A bare `file:` path is relative to the working directory, which is how the
 /// reference implementation reads one, and the escapes a written
 /// configuration carries have to come back off.
-fn symbol_path(url: &str) -> Option<std::path::PathBuf> {
+fn file_path(url: &str) -> Option<std::path::PathBuf> {
     let path = url.strip_prefix("file:")?;
     let path = path.strip_prefix("//").unwrap_or(path);
     Some(std::path::PathBuf::from(
         crate::framework::symbols::intermed::percent_decode(path),
     ))
-}
-
-/// The option a dotted setting path names.
-fn setting_name(path: &str) -> String {
-    path.rsplit('.').next().unwrap_or(path).to_string()
 }
 
 /// A setting's value, as the configuration holds it.
@@ -938,18 +1007,18 @@ mod tests {
     #[test]
     fn a_file_url_names_a_path_that_may_be_absolute_or_relative() {
         assert_eq!(
-            symbol_path("file:ntkrnlmp.pdb/ABCDEF-2.json.xz"),
+            file_path("file:ntkrnlmp.pdb/ABCDEF-2.json.xz"),
             Some(std::path::PathBuf::from("ntkrnlmp.pdb/ABCDEF-2.json.xz"))
         );
         assert_eq!(
-            symbol_path("file:///tmp/a%20directory/ABCDEF-2.json.xz"),
+            file_path("file:///tmp/a%20directory/ABCDEF-2.json.xz"),
             Some(std::path::PathBuf::from("/tmp/a directory/ABCDEF-2.json.xz"))
         );
     }
 
     #[test]
     fn a_location_this_port_cannot_read_names_nothing() {
-        assert_eq!(symbol_path("https://example.invalid/ABCDEF-2.json.xz"), None);
-        assert_eq!(symbol_path("ABCDEF-2.json.xz"), None);
+        assert_eq!(file_path("https://example.invalid/ABCDEF-2.json.xz"), None);
+        assert_eq!(file_path("ABCDEF-2.json.xz"), None);
     }
 }
