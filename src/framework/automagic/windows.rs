@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::framework::automagic::image_cache;
 use crate::framework::automagic::pdbscan;
 use crate::framework::automagic::DetectedOs;
-use crate::framework::context::{Context, Module};
+use crate::framework::context::{ConfigValue, Context, Module};
 use crate::framework::layers::intel::{IntelLayer, WINDOWS_INTEL, WINDOWS_INTEL_32E, WINDOWS_INTEL_PAE};
 use crate::framework::layers::DataLayer;
 use crate::framework::symbols::intermed::{create_table, SymbolFinder, SymbolLocation};
@@ -569,6 +569,12 @@ pub fn detect(
         &layer_name,
         found.virtual_offset,
     ));
+    // Every symbol is read from this address, so a configuration written
+    // afterwards carries it and the next run does not have to find it again.
+    context.config.set(
+        "automagic.kernel_virtual_offset",
+        ConfigValue::Int(found.virtual_offset as i64),
+    );
     log::info!(
         "Windows kernel module built at {:#x}",
         found.virtual_offset
