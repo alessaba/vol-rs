@@ -377,20 +377,24 @@ fn bound_address(object: &Object) -> Option<Object> {
 /// family.
 fn dual_stack(object: &Object) -> Vec<(&'static str, String, String)> {
     let family = address_family(object);
-    match bound_address(object) {
-        Some(address) => match family {
-            Some(AF_INET) => vec![("v4", ipv4(&address), "0.0.0.0".to_string())],
-            Some(AF_INET6) => vec![("v6", ipv6(&address), "::".to_string())],
+    if let Some(address) = bound_address(object) {
+        // An address that cannot be read binds nothing, so it names no
+        // candidate rather than a wildcard one.
+        return match family {
+            Some(AF_INET) => ipv4(&address)
+                .map(|address| vec![("v4", address, "0.0.0.0".to_string())])
+                .unwrap_or_default(),
+            Some(AF_INET6) => ipv6(&address)
+                .map(|address| vec![("v6", address, "::".to_string())])
+                .unwrap_or_default(),
             _ => Vec::new(),
-        },
-        None => {
-            let mut found = vec![("v4", "0.0.0.0".to_string(), "0.0.0.0".to_string())];
-            if family == Some(AF_INET6) {
-                found.push(("v6", "::".to_string(), "::".to_string()));
-            }
-            found
-        }
+        };
     }
+    let mut found = vec![("v4", "0.0.0.0".to_string(), "0.0.0.0".to_string())];
+    if family == Some(AF_INET6) {
+        found.push(("v6", "::".to_string(), "::".to_string()));
+    }
+    found
 }
 
 /// The address at both ends of a connection.
@@ -404,7 +408,7 @@ fn local_address(object: &Object) -> Option<String> {
         .and_then(|data| data.dereference())
         .and_then(|data| data.dereference())
         .ok()?;
-    Some(family_address(object, &address))
+    family_address(object, &address)
 }
 
 fn remote_address(object: &Object) -> Option<String> {
@@ -414,11 +418,14 @@ fn remote_address(object: &Object) -> Option<String> {
         .and_then(|info| info.member("Remote"))
         .and_then(|remote| remote.dereference())
         .ok()?;
-    Some(family_address(object, &address))
+    family_address(object, &address)
 }
 
 /// Render an address in the form its family calls for.
-fn family_address(object: &Object, address: &Object) -> String {
+///
+/// An address that cannot be read has no form to report, which is different
+/// from one that is all zeroes.
+fn family_address(object: &Object, address: &Object) -> Option<String> {
     match address_family(object) {
         Some(AF_INET) => ipv4(address),
         _ => ipv6(address),
@@ -426,37 +433,38 @@ fn family_address(object: &Object, address: &Object) -> String {
 }
 
 /// The four bytes of a version four address.
-fn ipv4(address: &Object) -> String {
-    let bytes = address_bytes(address, "addr4", 4);
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
+fn ipv4(address: &Object) -> Option<String> {
+    let bytes = address_bytes(address, "addr4", 4)?;
+    Some(format!(
+        "{}.{}.{}.{}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    ))
 }
 
 /// The sixteen bytes of a version six address, written the way the C library
 /// writes one.
-fn ipv6(address: &Object) -> String {
-    let bytes = address_bytes(address, "addr6", 16);
+fn ipv6(address: &Object) -> Option<String> {
+    let bytes = address_bytes(address, "addr6", 16)?;
     let groups: Vec<u16> = bytes
         .chunks(2)
         .map(|pair| ((pair[0] as u16) << 8) | pair[1] as u16)
         .collect();
-    std::net::Ipv6Addr::new(
-        groups[0], groups[1], groups[2], groups[3], groups[4], groups[5], groups[6], groups[7],
+    Some(
+        std::net::Ipv6Addr::new(
+            groups[0], groups[1], groups[2], groups[3], groups[4], groups[5], groups[6], groups[7],
+        )
+        .to_string(),
     )
-    .to_string()
 }
 
-/// Read an address's bytes, treating anything unreadable as zero.
-fn address_bytes(address: &Object, member: &str, length: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; length];
-    if let Ok(array) = address.member(member) {
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = array
-                .index(index as u64)
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u8;
-        }
+/// Read an address's bytes, which are only worth reporting whole.
+fn address_bytes(address: &Object, member: &str, length: usize) -> Option<Vec<u8>> {
+    let array = address.member(member).ok()?;
+    let mut bytes = Vec::with_capacity(length);
+    for index in 0..length as u64 {
+        bytes.push(array.index(index).and_then(|value| value.as_u64()).ok()? as u8);
     }
-    bytes
+    Some(bytes)
 }
 
 /// Whether a socket is coherent enough to report.
