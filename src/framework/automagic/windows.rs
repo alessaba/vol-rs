@@ -143,12 +143,10 @@ impl SelfReferenceTest {
 
     /// Whether a page really looks like a page table.
     ///
-    /// A table with almost nothing in it is a decoy that recent Windows
-    /// leaves lying around, and one holding a pointer past the end of the
-    /// address space its layer admits is not a table for that layer. Both
-    /// checks are the ones upstream makes after a match.
+    /// One holding a pointer past the end of the address space its layer
+    /// admits is not a table for that layer, which is the check upstream makes
+    /// after a match.
     fn table_holds_up(&self, page: &[u8], limit: u64) -> bool {
-        let mut valid = 0usize;
         let mut highest = 0u64;
         for chunk in page.chunks_exact(self.entry_size) {
             let entry = read_entry(chunk);
@@ -157,11 +155,9 @@ impl SelfReferenceTest {
             if entry & 1 == 0 || entry & 0x80 != 0 {
                 continue;
             }
-            valid += 1;
             highest = highest.max((entry ^ (entry & 0xFFF)) % self.maximum_address);
         }
-        // Ten is the count upstream settles for.
-        valid >= 10 && highest <= limit
+        highest <= limit
     }
 }
 
@@ -248,27 +244,21 @@ pub fn paging_at(context: &Arc<Context>, layer_name: &str, dtb: u64) -> Option<&
 /// its own places to look.
 ///
 /// Where the DTB scan fails, upstream attempts a heuristic of checking for the
-/// DTB within a specific range. New versions of windows, with randomized
-/// self-referential pointers, appear to always load their dtb within a small
-/// specific range (`0x1a0000` and `0x1b0000`), so instead we scan for all
-/// self-referential pointers in that range, and ignore any that contain
-/// multiple self-references (since the DTB is very unlikely to point to itself
-/// more than once).
+/// DTB within a range near the start of physical memory. New versions of
+/// windows, with randomized self-referential pointers, appear to always load
+/// their dtb there, so instead we scan for all self-referential pointers in
+/// that range, and ignore any that contain multiple self-references (since the
+/// DTB is very unlikely to point to itself more than once). A very large
+/// capture can place it higher still, which is the third pass.
 ///
 /// The tests are grouped by region so we only run over the data once.
 const SEARCHES: &[(&[&SelfReferenceTest], &[(u64, u64)])] = &[
-    (
-        &[&TEST_64],
-        &[
-            (0x150000, 0x150000),
-            (0x550000, 0x1A0000),
-            (0x900000, 0x100000),
-        ],
-    ),
+    (&[&TEST_64], &[(0x150000, 0x8B0000)]),
     (
         &[&TEST_PAE, &TEST_32, &TEST_64_LEGACY],
         &[(0x30000, 0x100_0000)],
     ),
+    (&[&TEST_64], &[(0xA00000, 0x5000000)]),
 ];
 
 /// Scans through all pages using DTB tests to determine a dtb offset and
