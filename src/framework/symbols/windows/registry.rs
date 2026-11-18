@@ -20,6 +20,12 @@ use crate::framework::objects::Object;
 /// Guard against a hive whose links form a cycle.
 const MAX_KEYS: usize = 500_000;
 
+/// Where a value stops fitting in one cell, and the most one block of a larger
+/// value holds. The second is smaller because a block's own header takes room
+/// from the cell it sits in.
+const BIG_DATA_THRESHOLD: usize = 0x4000;
+const BIG_DATA_MAXLEN: usize = 0x3FD8;
+
 /// Registry value types, as stored in a `vk` cell's `Type` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
@@ -180,9 +186,10 @@ impl RegistryValue {
     ///
     /// Determine if the data is stored inline: data of four bytes or fewer is
     /// stored inline in the `Data` field itself, with the high bit of the
-    /// length marking that case, and the high bit is then removed. Anything
-    /// larger is bigdata, where, oddly, we get a list of addresses, at which
-    /// are addresses, which then point to data blocks.
+    /// length marking that case, and the high bit is then removed. A value too
+    /// large for one cell is kept as a list of cells, described by a
+    /// `_CM_BIG_DATA` header in the cell the value names, and only hives of
+    /// version five do that. Anything else is one cell of bytes.
     pub fn data(&self, hive: &RegistryHive) -> Result<Vec<u8>> {
         let raw_length = self.object.member("DataLength")?.as_u64()?;
         let inline = raw_length & 0x8000_0000 != 0;
@@ -208,6 +215,13 @@ impl RegistryValue {
 
         let cell_index = data_field.as_u64()?;
         let context = self.object.context().clone();
+
+        // A value larger than one cell is kept as a list of cells, described
+        // by a header in the cell the value names.
+        if hive.version() == 5 && length > BIG_DATA_THRESHOLD {
+            return read_big_data(&context, hive, cell_index, length);
+        }
+
         // The cell's four-byte size header precedes the data.
         context
             .layers
@@ -238,6 +252,59 @@ impl RegistryValue {
             _ => hex::encode(&data),
         })
     }
+}
+
+/// Read a value the hive kept as a list of cells.
+///
+/// The cell the value names holds a `_CM_BIG_DATA` header: a count of blocks,
+/// and the index of a cell listing one cell index per block. Each of those
+/// cells holds one block of the value, in order. A block that cannot be read
+/// is left as zeroes so the bytes after it keep their place, which is what the
+/// reference does.
+fn read_big_data(
+    context: &Arc<Context>,
+    hive: &RegistryHive,
+    header_cell: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let header = header_cell + 4;
+    let count = u16::from_le_bytes(
+        context
+            .layers
+            .read(hive.name(), header + 2, 2, true)?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let list = u32::from_le_bytes(
+        context
+            .layers
+            .read(hive.name(), header + 4, 4, true)?
+            .try_into()
+            .unwrap(),
+    ) as u64;
+
+    let mut data = Vec::with_capacity(length);
+    let mut remaining = length;
+    for index in 0..count {
+        if remaining == 0 {
+            break;
+        }
+        let Ok(entry) = context
+            .layers
+            .read(hive.name(), list + 4 + index as u64 * 4, 4, true)
+        else {
+            break;
+        };
+        let block = u32::from_le_bytes(entry.try_into().unwrap()) as u64;
+
+        let amount = remaining.min(BIG_DATA_MAXLEN);
+        match context.layers.read(hive.name(), block + 4, amount, true) {
+            Ok(bytes) => data.extend_from_slice(&bytes),
+            Err(_) => data.resize(data.len() + amount, 0),
+        }
+        remaining -= amount;
+    }
+    Ok(data)
 }
 
 pub fn decode_utf16(data: &[u8]) -> String {

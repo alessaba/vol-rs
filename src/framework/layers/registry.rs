@@ -156,6 +156,16 @@ impl RegistryHive {
         self.hive.offset()
     }
 
+    /// The version of the hive's file format, which says whether a value too
+    /// large for one cell is kept as a list of cells.
+    pub fn version(&self) -> u64 {
+        let inner = self.hive.member("Hive").unwrap_or_else(|_| self.hive.clone());
+        inner
+            .member("Version")
+            .and_then(|version| version.as_u64())
+            .unwrap_or(0)
+    }
+
     /// The cell index of the hive's root key.
     /// Returns the offset for the root cell in this hive.
     pub fn root_cell_offset(&self) -> u64 {
