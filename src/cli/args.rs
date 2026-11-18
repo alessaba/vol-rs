@@ -163,6 +163,12 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
         };
 
         match flag {
+            // Everything after the terminator is the plugin and its own
+            // options, even where one of them looks like a framework option.
+            "--" => {
+                index += 1;
+                break;
+            }
             "-h" | "--help" => {
                 args.show_help = true;
                 index += 1;
@@ -248,6 +254,13 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
                     args.parallelism = Some("processes".to_string());
                     index += 1;
                 }
+                let value = args.parallelism.as_deref().unwrap_or_default();
+                if !matches!(value, "processes" | "threads" | "off") {
+                    return Err(VolatilityError::Other(format!(
+                        "argument --parallelism: invalid choice: '{value}' \
+                         (choose from processes, threads, off)"
+                    )));
+                }
             }
             "--filters" => {
                 let value = take_value(argv, &mut index, argument)?;
@@ -274,25 +287,15 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
                 args.single_location = Some(take_value(argv, &mut index, argument)?);
             }
             "--stackers" => {
-                index += 1;
-                while index < argv.len()
-                    && !argv[index].starts_with('-')
-                    && !is_plugin(&argv[index])
-                {
-                    args.stackers.push(argv[index].clone());
-                    index += 1;
-                }
+                take_values(argv, &mut index, argument, &mut args.stackers, &is_plugin)
             }
-            "--single-swap-locations" => {
-                index += 1;
-                while index < argv.len()
-                    && !argv[index].starts_with('-')
-                    && !is_plugin(&argv[index])
-                {
-                    args.single_swap_locations.push(argv[index].clone());
-                    index += 1;
-                }
-            }
+            "--single-swap-locations" => take_values(
+                argv,
+                &mut index,
+                argument,
+                &mut args.single_swap_locations,
+                &is_plugin,
+            ),
             other if other.starts_with("-v") && other[1..].chars().all(|c| c == 'v') => {
                 // -v, -vv, -vvv each add a level.
                 args.verbosity += (other.len() - 1) as u8;
@@ -350,7 +353,7 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
             // Framework flags are still accepted after the plugin name, since
             // that is where users naturally reach for `-v`.
             match argument.as_str() {
-                "-q" => args.format = OutputFormat::Quick,
+                "-q" | "--quiet" => args.quiet = true,
                 "-h" => args.show_help = true,
                 other if other.starts_with("-v") && other[1..].chars().all(|c| c == 'v') => {
                     args.verbosity += (other.len() - 1) as u8;
@@ -369,7 +372,38 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
         }
     }
 
+    // The reference implementation refuses to be told both at once.
+    if args.offline && args.remote_isf_url.is_some() {
+        return Err(VolatilityError::Other(
+            "argument -u/--remote-isf-url: not allowed with argument --offline".to_string(),
+        ));
+    }
+
     Ok(args)
+}
+
+/// Collect the values of an option that takes any number of them, whether they
+/// are given inline or as the arguments that follow.
+fn take_values(
+    argv: &[String],
+    index: &mut usize,
+    flag: &str,
+    values: &mut Vec<String>,
+    is_plugin: &impl Fn(&str) -> bool,
+) {
+    if let Some((_, inline)) = flag.split_once('=') {
+        values.push(inline.to_string());
+        *index += 1;
+        return;
+    }
+    *index += 1;
+    while let Some(value) = argv.get(*index) {
+        if value.starts_with('-') || is_plugin(value) {
+            break;
+        }
+        values.push(value.clone());
+        *index += 1;
+    }
 }
 
 fn take_value(argv: &[String], index: &mut usize, flag: &str) -> Result<String> {
