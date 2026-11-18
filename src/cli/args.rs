@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use crate::error::{Result, VolatilityError};
+use crate::framework::renderers::style::{ThemeKind, When};
 use crate::framework::context::ConfigValue;
 use crate::framework::plugins::{Plugin, RequirementKind};
 
@@ -47,6 +48,11 @@ impl OutputFormat {
     /// the banner is kept out of the output stream.
     pub fn structured(&self) -> bool {
         !matches!(self, OutputFormat::Quick | OutputFormat::None | OutputFormat::Pretty)
+    }
+
+    /// Whether the format is a table meant to be read on a terminal.
+    pub fn text(&self) -> bool {
+        matches!(self, OutputFormat::Quick | OutputFormat::Pretty)
     }
 }
 
@@ -95,6 +101,13 @@ pub struct Arguments {
     pub single_location: Option<String>,
     pub stackers: Vec<String>,
     pub single_swap_locations: Vec<String>,
+    /// When to paint the human-readable output.
+    pub color: When,
+    pub theme: ThemeKind,
+    /// Whether to print a one-line summary under the table.
+    pub summary: bool,
+    /// Whether to send long output through a pager.
+    pub pager: bool,
 }
 
 impl Default for Arguments {
@@ -128,6 +141,10 @@ impl Default for Arguments {
             single_location: None,
             stackers: Vec::new(),
             single_swap_locations: Vec::new(),
+            color: When::Auto,
+            theme: ThemeKind::Dark,
+            summary: false,
+            pager: false,
         }
     }
 }
@@ -282,6 +299,57 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
                     }
                 }
                 args.hide_columns = Some(names);
+            }
+            "--color" => {
+                let value = match argument.split_once('=') {
+                    Some((_, inline)) => {
+                        index += 1;
+                        Some(inline.to_string())
+                    }
+                    None => match argv.get(index + 1) {
+                        Some(next) if !next.starts_with('-') && !is_plugin(next) => {
+                            index += 2;
+                            Some(next.clone())
+                        }
+                        _ => {
+                            index += 1;
+                            None
+                        }
+                    },
+                };
+                args.color = match value.as_deref() {
+                    None | Some("auto") => When::Auto,
+                    Some("always") => When::Always,
+                    Some("never") => When::Never,
+                    Some(other) => {
+                        return Err(VolatilityError::Other(format!(
+                            "argument --color: invalid choice: '{other}' \
+                             (choose from auto, always, never)"
+                        )))
+                    }
+                };
+            }
+            "--theme" => {
+                let value = take_value(argv, &mut index, argument)?;
+                args.theme = match value.to_ascii_lowercase().as_str() {
+                    "dark" => ThemeKind::Dark,
+                    "light" => ThemeKind::Light,
+                    "mono" => ThemeKind::Mono,
+                    other => {
+                        return Err(VolatilityError::Other(format!(
+                            "argument --theme: invalid choice: '{other}' \
+                             (choose from dark, light, mono)"
+                        )))
+                    }
+                };
+            }
+            "--summary" => {
+                args.summary = true;
+                index += 1;
+            }
+            "--pager" => {
+                args.pager = true;
+                index += 1;
             }
             "--single-location" => {
                 args.single_location = Some(take_value(argv, &mut index, argument)?);

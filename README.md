@@ -32,6 +32,18 @@ Every option the Python version takes is taken here too, with the same names and
 
 ## Symbols
 
+Tables and help pages are coloured when the output is a terminal, and left
+plain everywhere else: a pipe, a file, `NO_COLOR`, `TERM=dumb`, `--color=never`
+and `--theme mono` all produce exactly the bytes they produced before.
+`--color=always` and `FORCE_COLOR=1` force colour through a pipe, for `less -R`.
+
+The colours say what a cell means rather than what its column is called: the
+"no value here" states each read differently, addresses and timestamps are
+separable at a glance, a process ID keeps one hue across plugins, and a
+`--filters` match is emphasised. `--theme light` suits a light background,
+`--summary` adds a dim count under the table, and `--pager` sends long output
+through `less`.
+
 Symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/symbols` when that variable is not set. A pack somewhere else is named with `--symbol-dirs` or through the `VOLRS_SYMBOL_PATH` environment variable. A Windows kernel that no pack describes is looked up on the Microsoft symbol server, and the database found there is turned into a symbol file and kept, so the fetch happens once. The database itself is cached under `~/.cache/vol-rs` and the symbol file is written beside the packs.
 
 ## What has been checked

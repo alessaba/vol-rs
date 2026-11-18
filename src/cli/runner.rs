@@ -4,7 +4,7 @@
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 
 use crate::error::{Result, VolatilityError};
@@ -14,6 +14,7 @@ use crate::framework::plugins::{OperatingSystem, PluginRegistry};
 use crate::framework::renderers::csv::CsvRenderer;
 use crate::framework::renderers::json::JsonRenderer;
 use crate::framework::renderers::text::{PrettyTextRenderer, QuickTextRenderer};
+use crate::framework::renderers::style::{Role, Style};
 use crate::framework::renderers::Renderer;
 use crate::framework::symbols::intermed::SymbolFinder;
 
@@ -24,6 +25,7 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     let registry = PluginRegistry::new();
     let arguments = args::parse_with(argv, |name| registry.get(name).is_some())?;
     configure_logging(arguments.verbosity, arguments.log.as_deref());
+    let style = Style::new(arguments.color, arguments.theme);
 
     // Where the caches live and whether the network may be used are settled
     // before anything reads them.
@@ -68,13 +70,13 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     // `vol <plugin> --help` describes that plugin's own options.
     if arguments.show_help {
         if let Some(plugin) = arguments.plugin.as_deref().and_then(|name| registry.get(name)) {
-            print!("{}", crate::cli::help::plugin_help(plugin.as_ref()));
+            print!("{}", crate::cli::help::plugin_help(plugin.as_ref(), style));
             return Ok(0);
         }
     }
 
     if arguments.show_help {
-        print!("{}", framework_help(&registry));
+        print!("{}", framework_help(&registry, style));
         return Ok(0);
     }
 
@@ -82,7 +84,7 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
         // Upstream announces itself as soon as the arguments have parsed and
         // only then complains that no plugin was named, so the announcement
         // comes out ahead of the complaint.
-        announce(&arguments);
+        announce(&arguments, style);
         // The same complaint the reference implementation makes, with the same
         // usage block above it.
         eprint!("{}", crate::cli::help::framework_usage_block());
@@ -178,7 +180,7 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
 
     // Upstream announces itself once the arguments are settled and before
     // anything is opened.
-    announce(&arguments);
+    announce(&arguments, style);
 
     // Settings given directly on the command line, as `path=value`.
     for extension in &arguments.extend {
@@ -445,9 +447,15 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     options.prepare(&grid, &arguments.filters);
 
     let renderer: Box<dyn Renderer> = match arguments.format {
-        OutputFormat::Pretty => Box::new(PrettyTextRenderer { options }),
+        OutputFormat::Pretty => Box::new(PrettyTextRenderer {
+            options,
+            style,
+            summary: arguments.summary,
+        }),
         OutputFormat::Quick => Box::new(QuickTextRenderer {
             options,
+            style,
+            summary: arguments.summary,
             ..Default::default()
         }),
         OutputFormat::Csv => Box::new(CsvRenderer {
@@ -467,16 +475,28 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
         OutputFormat::Arrow | OutputFormat::Parquet => unreachable!(),
     };
 
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    if let Err(error) = renderer.render(&grid, &mut handle) {
-        let _ = handle.flush();
+    // Long tables are easier to read one screen at a time, but only when a
+    // person asked for that and is watching a terminal.
+    let paged = arguments.pager && arguments.format.text() && std::io::stdout().is_terminal();
+    if paged {
+        let mut buffer = Vec::new();
+        if let Err(error) = renderer.render(&grid, &mut buffer) {
+            report_exception(&error);
+            return Ok(1);
+        }
+        page(&buffer);
+    } else {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        if let Err(error) = renderer.render(&grid, &mut handle) {
+            let _ = handle.flush();
+            drop(handle);
+            report_exception(&error);
+            return Ok(1);
+        }
+        handle.flush()?;
         drop(handle);
-        report_exception(&error);
-        return Ok(1);
     }
-    handle.flush()?;
-    drop(handle);
 
     // A run that died part-way has already written everything it is going to
     // write, and says so only through its exit status.
@@ -725,13 +745,13 @@ fn configure_logging(verbosity: u8, log: Option<&std::path::Path>) {
 }
 
 /// The framework's own help page, with every plugin listed.
-fn framework_help(registry: &PluginRegistry) -> String {
+fn framework_help(registry: &PluginRegistry, style: Style) -> String {
     let plugins: Vec<(String, String)> = registry
         .all()
         .iter()
         .map(|plugin| (plugin.name().to_string(), plugin.description().to_string()))
         .collect();
-    crate::cli::help::framework_help(&plugins)
+    crate::cli::help::framework_help(&plugins, style)
 }
 
 #[allow(dead_code)]
@@ -1005,14 +1025,39 @@ pub fn describe_exception(error: &VolatilityError) {
 /// A machine-readable format keeps its own stream clean, so the announcement
 /// goes to the error stream instead, which is the choice upstream makes from
 /// the renderer's `structured_output`.
-fn announce(arguments: &args::Arguments) {
+fn announce(arguments: &args::Arguments, style: Style) {
     let (major, minor, patch) = crate::interface_version();
     let banner = format!("Volatility 3 Framework {major}.{minor}.{patch}");
     if arguments.format.structured() {
         eprintln!("{banner}");
     } else {
-        println!("{banner}");
+        println!("{}", style.paint(Role::Faint, &banner));
     }
+}
+
+/// Show buffered output one screen at a time.
+///
+/// A pager that cannot be started is not worth failing a run over, so the text
+/// is written straight out instead.
+fn page(buffer: &[u8]) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new("less")
+        .args(["-R", "-F", "-X"])
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::io::stdout().write_all(buffer);
+            return;
+        }
+    };
+    if let Some(mut input) = child.stdin.take() {
+        let _ = input.write_all(buffer);
+    }
+    let _ = child.wait();
 }
 
 #[cfg(test)]

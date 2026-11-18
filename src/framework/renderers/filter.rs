@@ -145,6 +145,34 @@ impl RenderOptions {
     }
 }
 
+impl RenderOptions {
+    /// The cells a rule that keeps rows matched, so the renderer can emphasise
+    /// them.
+    ///
+    /// A rule that drops rows is not shown: the row it matched never reaches
+    /// the output in the first place.
+    pub fn highlights(&self, cells: &[String]) -> Vec<bool> {
+        let mut matched = vec![false; cells.len()];
+        for rule in self.rules.iter().filter(|rule| !rule.exclude) {
+            match rule.column {
+                Some(column) => {
+                    if cells.get(column).is_some_and(|cell| rule.find(cell)) {
+                        matched[column] = true;
+                    }
+                }
+                None => {
+                    for (index, cell) in cells.iter().enumerate() {
+                        if rule.find(cell) {
+                            matched[index] = true;
+                        }
+                    }
+                }
+            }
+        }
+        matched
+    }
+}
+
 impl Rule {
     fn matches(&self, cells: &[String]) -> bool {
         let found = match self.column {

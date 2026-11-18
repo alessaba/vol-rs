@@ -11,6 +11,7 @@
 //! the Volatility Software License 1.0.
 
 use crate::framework::plugins::{Plugin, Requirement, RequirementKind};
+use crate::framework::renderers::style::{Role, Style};
 
 /// argparse's ceiling on where the help column may start.
 const MAX_HELP_POSITION: usize = 24;
@@ -157,19 +158,27 @@ pub fn plugin_usage_block(plugin: &dyn Plugin) -> String {
     format_usage(&format!("vol {}", plugin.name()), &actions, width)
 }
 
-pub fn plugin_help(plugin: &dyn Plugin) -> String {
+pub fn plugin_help(plugin: &dyn Plugin, style: Style) -> String {
     let width = text_width();
     let actions = actions(plugin);
+    let program = format!("vol {}", plugin.name());
 
-    let mut help = format_usage(&format!("vol {}", plugin.name()), &actions, width);
+    let mut help = paint_usage(
+        &format_usage(&program, &actions, width),
+        &program,
+        &[],
+        style,
+    );
     // A plugin upstream leaves undocumented has no description to print.
     if !plugin.description().is_empty() {
         help.push('\n');
         help.push_str(&fill(plugin.description(), width));
         help.push('\n');
     }
-    help.push_str("\noptions:\n");
-    help.push_str(&format_actions(&actions, width));
+    help.push_str("\n");
+    help.push_str(&style.paint(Role::Heading, "options:"));
+    help.push('\n');
+    help.push_str(&format_actions(&actions, width, style));
     if let Some(epilog) = plugin.epilog() {
         help.push('\n');
         help.push_str(&fill(epilog, width));
@@ -242,14 +251,14 @@ fn pack(parts: &[String], indent: &str, prefix: Option<usize>, width: usize) -> 
 }
 
 /// The option list, each entry with its help wrapped into the help column.
-fn format_actions(actions: &[Action], width: usize) -> String {
+fn format_actions(actions: &[Action], width: usize, style: Style) -> String {
     let longest = actions
         .iter()
         .map(|action| action.invocation().len() + 2)
         .max()
         .unwrap_or(0);
     let help_position = longest.saturating_add(2).min(MAX_HELP_POSITION);
-    format_actions_at(actions, width, help_position, 2)
+    format_actions_at(actions, width, help_position, 2, style, &[])
 }
 
 /// The same, with the help column and the indent given.
@@ -258,6 +267,8 @@ fn format_actions_at(
     width: usize,
     help_position: usize,
     indent: usize,
+    style: Style,
+    positionals: &[&str],
 ) -> String {
     let help_width = width.saturating_sub(help_position).max(11);
     let action_width = help_position.saturating_sub(indent + 2);
@@ -266,12 +277,18 @@ fn format_actions_at(
     let mut out = String::new();
     for action in actions {
         let invocation = action.invocation();
+        let painted = paint_tokens(&invocation, style, true, positionals);
         // An option too wide for the column starts its help on the next line.
         let indent_first = if invocation.len() <= action_width {
-            out.push_str(&format!("{margin}{invocation:action_width$}  "));
+            out.push_str(&margin);
+            out.push_str(&painted);
+            out.push_str(&" ".repeat(action_width.saturating_sub(invocation.len())));
+            out.push_str("  ");
             0
         } else {
-            out.push_str(&format!("{margin}{invocation}\n"));
+            out.push_str(&margin);
+            out.push_str(&painted);
+            out.push('\n');
             help_position
         };
 
@@ -473,6 +490,26 @@ fn framework_actions() -> Vec<Action> {
                 .to_string(),
         ),
         option(
+            &["--color"],
+            "WHEN",
+            "When to colour the output (auto, always, never)".to_string(),
+        ),
+        option(
+            &["--theme"],
+            "THEME",
+            "Colour theme to use (dark, light, mono)".to_string(),
+        ),
+        option(
+            &["--summary"],
+            "",
+            "Print a one-line summary after the table".to_string(),
+        ),
+        option(
+            &["--pager"],
+            "",
+            "Page long output through less".to_string(),
+        ),
+        option(
             &["--single-location"],
             "SINGLE_LOCATION",
             "Specifies a base location on which to stack".to_string(),
@@ -534,7 +571,7 @@ pub fn framework_usage_block() -> String {
 }
 
 /// The whole help page for the framework itself.
-pub fn framework_help(plugins: &[(String, String)]) -> String {
+pub fn framework_help(plugins: &[(String, String)], style: Style) -> String {
     let width = text_width();
     let actions = framework_actions();
 
@@ -549,13 +586,22 @@ pub fn framework_help(plugins: &[(String, String)]) -> String {
         .unwrap_or(0);
     let help_position = longest.saturating_add(2).min(MAX_HELP_POSITION);
 
-    let mut help = framework_usage(width);
+    let mut help = paint_usage(
+        &framework_usage(width),
+        "vol",
+        &["PLUGIN"],
+        style,
+    );
     help.push('\n');
     help.push_str(&fill("An open-source memory forensics framework", width));
-    help.push_str("\n\noptions:\n");
-    help.push_str(&format_actions_at(&actions, width, help_position, 2));
+    help.push_str("\n\n");
+    help.push_str(&style.paint(Role::Heading, "options:"));
+    help.push('\n');
+    help.push_str(&format_actions_at(&actions, width, help_position, 2, style, &[]));
 
-    help.push_str("\nPlugins:\n");
+    help.push('\n');
+    help.push_str(&style.paint(Role::Heading, "Plugins:"));
+    help.push('\n');
     help.push_str(&fill_indented(
         "For plugin specific options, run 'vol <plugin> --help'",
         width,
@@ -565,7 +611,10 @@ pub fn framework_help(plugins: &[(String, String)]) -> String {
     help.push_str("\n\n");
     // The choice of plugin is a value in its own right, described by the list
     // of plugins beneath it.
-    help.push_str("  PLUGIN\n");
+    help.push_str(&format!(
+        "  {}\n",
+        style.paint(Role::PositionalStrong, "PLUGIN")
+    ));
     let choices: Vec<Action> = plugins
         .iter()
         .map(|(name, description)| Action {
@@ -575,8 +624,131 @@ pub fn framework_help(plugins: &[(String, String)]) -> String {
             required: true,
         })
         .collect();
-    help.push_str(&format_actions_at(&choices, width, help_position, 4));
+    let names: Vec<&str> = plugins.iter().map(|(name, _)| name.as_str()).collect();
+    help.push_str(&format_actions_at(
+        &choices,
+        width,
+        help_position,
+        4,
+        style,
+        &names,
+    ));
     help
+}
+
+/// Paint a laid-out usage block.
+///
+/// The block is measured and wrapped first, so nothing here takes part in the
+/// layout: the prefix, the program and each option are painted as they are
+/// found in the text that was already produced.
+fn paint_usage(text: &str, program: &str, positionals: &[&str], style: Style) -> String {
+    if !style.enabled() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let Some(rest) = line.strip_prefix("usage: ") else {
+            out.push_str(&paint_tokens(line, style, false, positionals));
+            continue;
+        };
+        out.push_str(&style.paint(Role::Usage, "usage: "));
+        match rest.strip_prefix(program) {
+            Some(after) => {
+                out.push_str(&style.paint(Role::Program, program));
+                out.push_str(&paint_tokens(after, style, false, positionals));
+            }
+            None => out.push_str(&paint_tokens(rest, style, false, positionals)),
+        }
+    }
+    out
+}
+
+/// Paint the options in a run of text, leaving everything else alone.
+///
+/// This runs over text that has already been laid out, so the escape sequences
+/// it adds never reach a width calculation.
+fn paint_tokens(text: &str, style: Style, strong: bool, positionals: &[&str]) -> String {
+    if !style.enabled() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut rest = text;
+    while !rest.is_empty() {
+        let indent = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..indent]);
+        rest = &rest[indent..];
+        if rest.is_empty() {
+            break;
+        }
+        let end = rest
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len());
+        out.push_str(&paint_token(&rest[..end], style, strong, positionals));
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Paint one word of a usage line or an option list.
+///
+/// Brackets and separators around the word stay plain, and so does anything
+/// that is not an option or a value.
+fn paint_token(token: &str, style: Style, strong: bool, positionals: &[&str]) -> String {
+    let start = token
+        .find(|character: char| character != '[' && character != '(')
+        .unwrap_or(token.len());
+    let end = token.trim_end_matches([']', ')', ',', '|']).len();
+    if start >= end {
+        return token.to_string();
+    }
+    let core = &token[start..end];
+    let role = if positionals.contains(&core) {
+        if strong {
+            Role::PositionalStrong
+        } else {
+            Role::Positional
+        }
+    } else if core.starts_with("--") {
+        if strong {
+            Role::OptionLongStrong
+        } else {
+            Role::OptionLong
+        }
+    } else if core.starts_with('-') && core.len() > 1 {
+        if strong {
+            Role::OptionStrong
+        } else {
+            Role::Option
+        }
+    } else if is_metavar(core) {
+        if strong {
+            Role::MetavarStrong
+        } else {
+            Role::Metavar
+        }
+    } else {
+        return token.to_string();
+    };
+    format!(
+        "{}{}{}",
+        &token[..start],
+        style.paint(role, core),
+        &token[end..]
+    )
+}
+
+/// Whether a word names an option's value rather than an option.
+fn is_metavar(core: &str) -> bool {
+    core.starts_with('{')
+        || (core.chars().any(|character| character.is_ascii_uppercase())
+            && core.chars().all(|character| {
+                character.is_ascii_uppercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '_' | '.' | ':' | '=')
+            }))
 }
 
 /// Wrap text and indent every line by the given amount.
