@@ -17,6 +17,7 @@ use crate::framework::objects::Object;
 use crate::framework::plugins::windows::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
+use crate::framework::symbols::windows::header_name_checked;
 use crate::framework::symbols::windows::poolscanner::{
     generate_pool_scan, header_cookie, object_type_map, object_type_of, PoolConstraint, FREE,
     NONPAGED, PAGED,
@@ -623,10 +624,9 @@ fn driver_name(
         return Detail::Unreadable;
     };
     match object_type_of(context, kernel, driver, type_map, cookie).as_deref() {
-        Some("Driver") => header
-            .member("NameInfo")
-            .and_then(|info| info.member("Name"))
-            .and_then(|name| unicode_string(&name))
+        // The name sits in an optional header whose distance is recorded in
+        // the object header, so it is read the way every other name is.
+        Some("Driver") => header_name_checked(&header, kernel)
             .map(Detail::Text)
             .unwrap_or(Detail::Unreadable),
         Some(_) => Detail::NotApplicable,
