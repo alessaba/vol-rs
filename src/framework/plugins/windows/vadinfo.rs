@@ -141,7 +141,7 @@ impl Plugin for VadInfo {
                             .map(Value::int)
                             .unwrap_or_else(Value::unreadable),
                         parent(&vad)
-                            .map(|address| Value::hex(canonical(&context, &kernel, address)))
+                            .map(|address| Value::hex(address))
                             .unwrap_or_else(Value::unreadable),
                         match file_name(&vad) {
                             Some(name) => Value::string(name),
@@ -405,6 +405,15 @@ pub fn parent(node: &Object) -> Option<u64> {
         // Older kernels name the parent outright. Newer ones keep it in the
         // tree node, where its low bits carry the balance instead.
         if let Ok(parent) = base.member("Parent").and_then(|value| value.pointer_value()) {
+            return Some(parent & !0x3);
+        }
+        // Vista through 7 keep it in the node's own union, beside the flags
+        // rather than under a tree node.
+        if let Ok(parent) = base
+            .member("u1")
+            .and_then(|union| union.member("Parent"))
+            .and_then(|parent| parent.pointer_value())
+        {
             return Some(parent & !0x3);
         }
         let Ok(tree) = base.member("VadNode") else {
