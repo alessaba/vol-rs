@@ -15,7 +15,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::registry::{read_key, subkeys, values, RegistryKey};
 use crate::framework::symbols::windows::sam::{
-    assemble_bootkey, decrypt_lsa_aes, decrypt_secret, lsa_key, BOOTKEY_SUBKEYS,
+    assemble_bootkey, decrypt_secret, lsa_key, BOOTKEY_SUBKEYS,
 };
 
 /// Dumps lsa secrets from memory
@@ -184,14 +184,11 @@ fn decode_entry(data: &[u8], nlkm: &[u8]) -> Option<CacheEntry> {
         return None;
     }
 
-    // The encrypted portion follows the header and is salted with its own IV,
-    // which the header carries at offset 0x40.
-    let encrypted = data.get(ENTRY_HEADER_SIZE..)?;
-    let mut salted = data.get(0x40..0x50)?.to_vec();
-    salted.resize(32, 0);
-    salted.extend_from_slice(encrypted);
-
-    let decrypted = decrypt_lsa_aes(&salted, nlkm).ok()?;
+    // The entry carries its own IV in the header, and is encrypted under the
+    // second half of the NL$KM secret.
+    let iv: [u8; 16] = data.get(0x40..0x50)?.try_into().ok()?;
+    let key = nlkm.get(16..32)?;
+    let decrypted = decrypt_aes_cbc(data.get(ENTRY_HEADER_SIZE..)?, key, &iv)?;
 
     // The plaintext opens with the hash, then the names, each padded to a
     // four-byte boundary.
@@ -220,6 +217,38 @@ fn decode_entry(data: &[u8], nlkm: &[u8]) -> Option<CacheEntry> {
         domain_name,
         hash,
     })
+}
+
+/// Decrypt a cache entry, which is chained so that every block is masked by
+/// the one before it.
+///
+/// The key is sixteen bytes taken from the NL$KM secret, and the entry names
+/// the block it starts from. A last block that is short is padded with zeroes
+/// rather than dropped, which is what the reference does.
+fn decrypt_aes_cbc(data: &[u8], key: &[u8], iv: &[u8; 16]) -> Option<Vec<u8>> {
+    use aes::cipher::{BlockCipherDecrypt, KeyInit};
+
+    let key: [u8; 16] = key.try_into().ok()?;
+    let cipher = aes::Aes128::new(&key.into());
+    let mut chain = *iv;
+    let mut output = Vec::with_capacity(data.len());
+
+    for chunk in data.chunks(16) {
+        let mut ciphertext = [0u8; 16];
+        ciphertext[..chunk.len()].copy_from_slice(chunk);
+
+        let mut block = ciphertext.into();
+        cipher.decrypt_block(&mut block);
+        let plain: [u8; 16] = block.into();
+        output.extend(
+            plain
+                .iter()
+                .zip(chain.iter())
+                .map(|(byte, previous)| byte ^ previous),
+        );
+        chain = ciphertext;
+    }
+    Some(output)
 }
 
 /// Unwrap the NL$KM secret, which protects the credential cache.

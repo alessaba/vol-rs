@@ -381,13 +381,13 @@ mod tests {
 /// by a repeated-MD5 construction. Later systems use `PolEKList` with AES.
 pub fn lsa_key(policy_value: &[u8], bootkey: &[u8; 16], is_vista_or_later: bool) -> Result<Vec<u8>> {
     if is_vista_or_later {
-        // The value opens with a 32-byte header, then the IV, then ciphertext.
-        if policy_value.len() < 0x40 {
+        // The value opens with a header and a salt, then the ciphertext.
+        if policy_value.len() < 0x3C {
             return Err(VolatilityError::Other(
                 "Policy value is too short for the AES layout".to_string(),
             ));
         }
-        let decrypted = decrypt_lsa_aes(&policy_value[0x3C..], bootkey)?;
+        let decrypted = decrypt_lsa_aes(policy_value, bootkey)?;
         // The key itself sits 68 bytes into the decrypted blob.
         if decrypted.len() < 68 + 32 {
             return Err(VolatilityError::Other(
@@ -419,13 +419,18 @@ pub fn lsa_key(policy_value: &[u8], bootkey: &[u8; 16], is_vista_or_later: bool)
 
 /// Decrypt an LSA blob using the AES scheme later Windows versions use.
 ///
-/// The key is a SHA-256 digest of the base key and the blob's own salt, run a
-/// thousand times, and the blob is then decrypted in ECB mode.
+/// The blob opens with a header and its own salt, then the ciphertext. The key
+/// is a SHA-256 digest of the base key and the salt, run a thousand times, and
+/// the ciphertext is then decrypted a block at a time without chaining.
 pub fn decrypt_lsa_aes(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     use aes::cipher::BlockCipherDecrypt;
     use sha2::{Digest as Sha2Digest, Sha256};
 
-    if data.len() < 32 {
+    /// Where the salt sits, and where the ciphertext begins.
+    const SALT: usize = 0x1C;
+    const CIPHERTEXT: usize = 0x3C;
+
+    if data.len() < CIPHERTEXT {
         return Err(VolatilityError::Other(
             "LSA blob is too short to decrypt".to_string(),
         ));
@@ -434,7 +439,7 @@ pub fn decrypt_lsa_aes(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     let mut hasher = Sha256::new();
     hasher.update(key);
     for _ in 0..1000 {
-        hasher.update(&data[..32]);
+        hasher.update(&data[SALT..CIPHERTEXT]);
     }
     let derived = hasher.finalize();
     // SHA-256 always yields 32 bytes, which is exactly an AES-256 key.
@@ -444,12 +449,14 @@ pub fn decrypt_lsa_aes(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         .expect("SHA-256 produces 32 bytes");
 
     let cipher = aes::Aes256::new(&derived.into());
-    let mut output = Vec::with_capacity(data.len() - 32);
+    let mut output = Vec::with_capacity(data.len() - CIPHERTEXT);
 
-    // The blob after the salt is a whole number of blocks, decrypted
-    // independently of each other.
-    for chunk in data[32..].chunks_exact(16) {
-        let block: [u8; 16] = chunk.try_into().expect("chunks_exact yields 16 bytes");
+    // The ciphertext is a whole number of blocks, decrypted independently of
+    // each other. A last block that is short is padded with zeroes, which is
+    // what the reference does rather than dropping it.
+    for chunk in data[CIPHERTEXT..].chunks(16) {
+        let mut block = [0u8; 16];
+        block[..chunk.len()].copy_from_slice(chunk);
         let mut block = block.into();
         cipher.decrypt_block(&mut block);
         output.extend_from_slice(&block);
@@ -460,16 +467,9 @@ pub fn decrypt_lsa_aes(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 /// Decrypt one LSA secret under the derived key.
 pub fn decrypt_secret(secret: &[u8], lsa_key: &[u8], is_vista_or_later: bool) -> Result<Vec<u8>> {
     if is_vista_or_later {
-        let decrypted = decrypt_lsa_aes(secret, lsa_key)?;
-        // The plaintext is length-prefixed, with the value following a header.
-        if decrypted.len() < 16 {
-            return Ok(decrypted);
-        }
-        let length = u32::from_le_bytes(decrypted[..4].try_into().unwrap()) as usize;
-        Ok(decrypted
-            .get(16..16 + length.min(decrypted.len().saturating_sub(16)))
-            .unwrap_or_default()
-            .to_vec())
+        // The plaintext opens with its own length and a short header, and the
+        // blob is reported whole, so both are part of what is returned.
+        decrypt_lsa_aes(secret, lsa_key)
     } else {
         // The older scheme keeps a twelve-byte header before the ciphertext.
         if secret.len() < 0x0C {
