@@ -33,6 +33,11 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     if arguments.clear_cache {
         crate::framework::cache::clear();
     }
+    // Plugins are compiled in, so a directory of them has nowhere to go. Say
+    // so rather than leaving a plugin that is not found unexplained.
+    if !arguments.plugin_dirs.is_empty() {
+        log::warn!("Plugin directories are not supported by this port");
+    }
     crate::framework::cache::set_offline(arguments.offline);
     if let Some(url) = &arguments.remote_isf_url {
         crate::framework::cache::set_remote_url(url.clone());
@@ -200,7 +205,9 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     }
 
     let mut finder = SymbolFinder::with_defaults();
-    for path in &arguments.symbol_paths {
+    // Each directory is put in front of the ones already there, so they are
+    // added from the last to the first to search them in the order given.
+    for path in arguments.symbol_paths.iter().rev() {
         finder.add_path(path.clone());
     }
     // Plugins that need one of the bundled symbol files load it themselves, so
@@ -235,10 +242,18 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
             let path = location_to_path(location)
                 .unwrap_or_else(|_| std::path::PathBuf::from(location));
             let name = context.layers.free_name("swap_layer");
-            context.layers.add(Arc::new(
-                crate::framework::layers::physical::FileLayer::new(&name, &path)?,
-            ));
-            names.push(name);
+            // A swap file that cannot be opened disables that layer rather
+            // than the run, which is what the reference implementation does.
+            match crate::framework::layers::physical::FileLayer::new(&name, &path) {
+                Ok(layer) => {
+                    context.layers.add(Arc::new(layer));
+                    names.push(name);
+                }
+                Err(error) => log::warn!(
+                    "Swap location {} could not be opened: {error}",
+                    path.display()
+                ),
+            }
         }
         crate::framework::layers::intel::set_swap_layers(names);
     }
