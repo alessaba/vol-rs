@@ -478,13 +478,23 @@ fn method_module_offset(
     physical_layer: &str,
 ) -> Option<ValidKernel> {
     // The loaded module list names the kernel's own image, and the entry holds
-    // its address a fixed distance before that name.
+    // its address a fixed distance before that name: the sixteen bytes of the
+    // list link, then one pointer.
+    let word = context
+        .layers
+        .get(virtual_layer)
+        .ok()?
+        .as_any()
+        .downcast_ref::<IntelLayer>()?
+        .config()
+        .bits_per_register
+        / 8;
     method_offset(
         context,
         virtual_layer,
         physical_layer,
         br"\SystemRoot\system32\nt",
-        -16 - 8,
+        -16 - word as i64,
     )
 }
 
@@ -504,7 +514,9 @@ fn method_fixed_mapping(
         };
         let bits = intel.config().bits_per_register;
         let virtual_offset = if bits == 64 {
-            let span = 64 - (intel.maximum_address() + 1).leading_zeros();
+            // The kernel is mapped at a fixed fraction of the address space,
+            // which is what the width of that space works out.
+            let span = 64 - intel.maximum_address().leading_zeros();
             mz_offset + (31u64 << (span - 5))
         } else {
             mz_offset + (1u64 << (bits - 1))

@@ -17,7 +17,7 @@ use crate::framework::layers::scanners::{scan_layer_until, RegExScanner};
 use crate::framework::automagic::DetectedOs;
 use crate::framework::context::{Context, Module};
 use crate::framework::layers::intel::{
-    INTEL, INTEL_32E, INTEL_PAE, IntelLayer, LINUX_INTEL, LINUX_INTEL_32E,
+    INTEL, INTEL_32E, INTEL_PAE, IntelLayer, LINUX_INTEL, LINUX_INTEL_32E, LINUX_INTEL_PAE,
 };
 use crate::framework::symbols::intermed::{create_table, SymbolFinder};
 
@@ -95,6 +95,9 @@ pub fn detect(
         table.set_source(location.url());
         log::debug!("Loading the symbol table took {:?}", started.elapsed());
         let pointer_size = table.pointer_size();
+        // Read before the table is handed over, since the class decision below
+        // needs to know how much high memory the kernel maps.
+        let pkmap = pkmap_count(&table);
         context.add_symbol_table(table);
 
         // The kernel is loaded at a randomised address, so the symbol
@@ -184,6 +187,9 @@ pub fn detect(
             None => match vmcoreinfo_layer_config(context, physical_layer, &found.banner) {
                 Some(config) => config,
                 None if pointer_size == 8 => LINUX_INTEL_32E,
+                // A 32-bit kernel that maps high memory keeps a `pkmap_count`
+                // of the size only a PAE kernel has.
+                None if matches!(pkmap, Some(512) | Some(2048)) => LINUX_INTEL_PAE,
                 None => LINUX_INTEL,
             },
         };
@@ -415,6 +421,18 @@ impl<'a> TaskProbe<'a> {
             virtual_shift,
             task_offset: hit,
         })
+    }
+}
+
+/// How many entries a kernel's `pkmap_count` array has, when it describes one.
+///
+/// A 32-bit kernel that maps high memory keeps one, and its size is what says
+/// the page tables are the three-level ones PAE uses.
+fn pkmap_count(table: &crate::framework::symbols::SymbolTable) -> Option<u64> {
+    let symbol = table.get_symbol("pkmap_count").ok()?;
+    match symbol.type_template.as_deref()? {
+        crate::framework::objects::template::Template::Array { count, .. } => Some(*count),
+        _ => None,
     }
 }
 
